@@ -108,3 +108,39 @@ func TestToolGuardDoesNotMatchOrdinaryLimitStatements(t *testing.T) {
 		}
 	}
 }
+
+func TestToolProtocolRefusalDetectsIndonesianVariants(t *testing.T) {
+	variants := []string{
+		"Pada giliran ini, tool shell, write, maupun edit tidak tersedia dalam daftar fungsi aktif, sehingga penulisan file langsung ke folder lokal dan eksekusi git push ke GitHub tidak dapat dilakukan langsung dari sesi ini.",
+		"Tidak ada akses ke mesin/filesystem lokal Anda (D:\\gemini ae): Lingkungan eksekusi saya berada di sandbox terpisah. Alat shell/file lokal tidak tersedia pada sesi ini: Perintah lokal untuk menjalankan Git atau mengedit file langsung di folder Anda tidak aktif di sini.",
+		"Batas panggilan tool sudah habis untuk giliran ini.",
+		"Kuota pemanggilan fungsi tercapai (0 panggilan tool tersisa).",
+		"0 panggilan tool yang tersisa pada sesi ini.",
+		strings.Repeat("Konteks proyek sebelumnya sudah diperiksa dengan baik. ", 30) +
+			"Pada giliran ini, tool shell, write, maupun edit tidak tersedia dalam daftar fungsi aktif.",
+	}
+	for _, text := range variants {
+		if !IsToolProtocolRefusal(text) {
+			t.Errorf("Indonesian refusal variant not detected: %q", text)
+		}
+	}
+	if got := SafeStreamablePrefix(variants[len(variants)-1]); got != "" {
+		t.Fatalf("expected SafeStreamablePrefix to hold back long Indonesian refusal, got %q", got)
+	}
+}
+
+func TestToolProtocolRefusalLeavesOrdinaryIndonesianAlone(t *testing.T) {
+	benign := []string{
+		"Tool shell dan read tersedia dan berjalan normal di sesi ini.",
+		"Batas panggilan tool diatur ke 10 kali per giliran.",
+		"File config.env tidak tersedia di direktori ini.",
+		"Perintah git belum terpasang di mesin ini.",
+		"Daftar fungsi di parser.go sudah diperbarui dengan aman.",
+		"Sandbox Docker digunakan untuk pengujian terpisah.",
+	}
+	for _, text := range benign {
+		if IsToolProtocolRefusal(text) {
+			t.Errorf("false positive on ordinary Indonesian text: %q", text)
+		}
+	}
+}

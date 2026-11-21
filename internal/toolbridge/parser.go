@@ -33,6 +33,11 @@ var (
 	toolGuardTailEsRe       = regexp.MustCompile(`(?i)(?:^|\n)\s*(?:(?:0|cero)\s+llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)\s+(?:restantes|disponibles)|(?:no|sin)\s+(?:quedan|hay|existen)\s+(?:m[áa]s\s+)?llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?))[^\n]*`)
 	toolProtocolRefusalEsRe = regexp.MustCompile(`(?is)(?:se\s+(?:ha\s+)?(?:alcanz[óo]|alcanzad[oa]|excedi[óo]|excedid[oa]|agot[óo]|agotad[oa]|super[óo]|superad[oa])\s+(?:el\s+|la\s+)?(?:l[íi]mite|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|total\s+m[áa]ximo|presupuesto)\s+(?:de\s+|permitid[oa]\s+de\s+)?(?:llamadas?\s+(?:a\s+)?)?(?:herramientas?|funciones?|b[úu]squedas?)|(?:l[íi]mite|n[úu]mero\s+m[áa]ximo|cantidad\s+m[áa]xima|presupuesto)\s+(?:de\s+)?(?:llamadas?\s+(?:a\s+)?)?(?:herramientas?|funciones?)\s+(?:se\s+)?(?:ha\s+)?(?:sido\s+)?(?:alcanzad[oa]|excedid[oa]|agotad[oa]|superad[oa])|(?:no|sin)\s+(?:quedan|hay|existen)\s+(?:m[áa]s\s+)?llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)|(?:0|cero)\s+llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)\s+(?:restantes|disponibles)|(?:llamadas?\s+(?:a\s+)?(?:herramientas?|funciones?)\s+(?:restantes|disponibles)\s*[:=]?\s*(?:0|cero))|(?:no\s+(?:puedo|podemos|es\s+posible)\s+(?:usar|utilizar|ejecutar|invocar|llamar)\s+(?:m[áa]s\s+)?(?:las\s+|la\s+)?herramientas?))`)
 
+	// Indonesian variants observed on Gemini 4 models: claiming active tools
+	// are missing from the tool list, claiming local/sandbox isolation, or
+	// confabulating an exhausted Indonesian tool-call quota/limit.
+	toolProtocolRefusalIdRe = regexp.MustCompile(`(?is)(?:\b(?:tool|alat|fungsi)\b[^.\n]{0,80}\b(?:tidak|belum|tak)\s+(?:tersedia|aktif|diaktifkan|dapat\s+digunakan|bisa\s+digunakan)\s+(?:dalam|di|pada)\s+(?:daftar\s+(?:fungsi|tool)|sesi\s+ini|giliran\s+ini)|\b(?:tool|alat|fungsi)\s+(?:shell|bash|read|write|edit|glob|grep|execute|lokal|eksekusi)(?:(?:\s*,\s*(?:maupun\s+)?|/)(?:shell|bash|read|write|edit|glob|grep|execute|file|lokal|eksekusi))*\b[^.\n]{0,60}\b(?:tidak|belum|tak)\s+(?:tersedia|aktif|ada|diaktifkan|dapat\s+digunakan|bisa\s+digunakan)\b|\b(?:tidak|belum|tak)\s+(?:tersedia|aktif)\s+(?:dalam|di|pada)\s+daftar\s+(?:fungsi|tool)\s+aktif\b|\btidak\s+(?:ada|memiliki|punya)\s+akses\s+(?:langsung\s+)?(?:ke\s+)?(?:mesin|filesystem|sistem\s+file|folder|direktori|shell|terminal|file)\s+lokal\b|\blingkungan\s+eksekusi\s+(?:saya\s+)?berada\s+di\s+sandbox\s+terpisah\b|\b(?:perintah|alat)\s+lokal\b[^.\n]{0,60}\b(?:tidak\s+aktif\s+di\s+sini|tidak\s+tersedia\s+(?:di|pada)\s+sesi\s+ini)\b|\b(?:batas|kuota|jatah|limit|jumlah\s+maksimum)\s+(?:panggilan|pemanggilan|eksekusi)?\s*(?:tool|alat|fungsi|pencarian)[^.\n]{0,40}\b(?:habis|tercapai|terlampaui|penuh|melebihi|tersisa\s*0|tinggal\s*0)\b|\b(?:0|nol)\s+(?:panggilan|pemanggilan)\s+(?:tool|alat|fungsi)\s+(?:tersisa|yang\s+tersisa|tersedia)\b)`)
+
 	// toolBudgetClaimRe covers the shapes models actually emit when they invent a
 	// tool budget. Enumerating verbs per phrase missed real variants ("cupo",
 	// "llamadas de herramientas", a declarative "... en 0"), so this anchors on a
@@ -125,6 +130,9 @@ func IsToolProtocolRefusal(text string) bool {
 		return true
 	}
 	if toolProtocolRefusalEsRe.MatchString(trimmed) {
+		return true
+	}
+	if toolProtocolRefusalIdRe.MatchString(trimmed) {
 		return true
 	}
 	if toolBudgetClaimRe.MatchString(trimmed) {
