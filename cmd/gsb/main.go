@@ -329,12 +329,16 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 		}
 	}
 	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
+	_, statErr := os.Stat(outPath)
 	srv := server.New(cfg)
 	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
 	ac.SetProvenance(dbPath, explicitDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := ac.Bootstrap(ctx); err != nil {
+		if os.IsNotExist(statErr) {
+			_ = os.Remove(outPath)
+		}
 		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
 	}
 	fmt.Printf("Imported account %q (%s) -> %s\n", acctName, ac.Email(), outPath)
@@ -368,12 +372,16 @@ func runImportCookie(cfg config.Config, acctName, rawVal, filePath string) error
 		return fmt.Errorf("cookie payload does not contain SAPISID")
 	}
 	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
+	_, statErr := os.Stat(outPath)
 	srv := server.New(cfg)
 	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
 	ac.SetProvenance(filePath, "cookie-export")
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := ac.Bootstrap(ctx); err != nil {
+		if os.IsNotExist(statErr) {
+			_ = os.Remove(outPath)
+		}
 		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
 	}
 	fmt.Printf("Imported account %q (%s) -> %s\n", acctName, ac.Email(), outPath)

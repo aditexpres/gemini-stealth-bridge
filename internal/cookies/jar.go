@@ -19,7 +19,10 @@ var EssentialNames = []string{
 	"SID", "HSID", "SSID", "APISID", "SAPISID",
 	"__Secure-1PSID", "__Secure-1PAPISID", "__Secure-3PSID", "__Secure-3PAPISID",
 	"__Secure-1PSIDTS", "__Secure-3PSIDTS",
-	"SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC", "NID", "AEC",
+	"__Secure-1PSIDRTS", "__Secure-3PSIDRTS",
+	"SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC",
+	"OSID", "__Secure-OSID",
+	"NID", "AEC",
 }
 
 var essentialSet = func() map[string]bool {

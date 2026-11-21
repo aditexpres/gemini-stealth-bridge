@@ -522,6 +522,11 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 	if res.Status == 200 {
 		at = matchFirst(snlm0eRe, res.Body)
 	}
+	initialStatus := res.Status
+	initialLoc := ""
+	if res.Headers != nil {
+		initialLoc = res.Headers["location"]
+	}
 	// Self-heal expired __Secure-1PSIDTS / SIDCC before declaring session dead:
 	// if /app failed or returned no SNlM0e token, run RotateCookies once and retry.
 	var lastRotRes *cookies.RotateResult
@@ -540,7 +545,13 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 	}
 
 	if lastRotRes != nil && lastRotRes.Status == 429 && at == "" {
-		return transport.NewUpstreamError("cookie rotation rate limited (HTTP 429)", 429, "rate_limit_error", res.Headers, nil)
+		return transport.NewUpstreamError(
+			fmt.Sprintf("cookie rotation rate limited (HTTP 429; initial GET /app returned HTTP %d, location=%q, bodyLen=%d)", initialStatus, initialLoc, len(res.Body)),
+			429,
+			"rate_limit_error",
+			res.Headers,
+			nil,
+		)
 	}
 
 	if res.Status != 200 {
