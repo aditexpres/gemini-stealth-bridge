@@ -215,16 +215,21 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		pingerMu.Unlock()
 		p.Stop()
 	}
-	defer stopKeepalive()
-	// Defers run LIFO, so this runs before stopKeepalive: the pinger sees
-	// handlerDone and exits instead of writing after the handler returns.
-	defer handlerDone.Store(true)
-
 	// streamStarted closes as soon as the response headers are flushed, so the
 	// grace timer below does not keep a goroutine alive after streaming begins.
 	streamStarted := make(chan struct{})
 	var streamStartedOnce sync.Once
 	markStreamStarted := func() { streamStartedOnce.Do(func() { close(streamStarted) }) }
+
+	var graceWG sync.WaitGroup
+	// Defers run LIFO: mark handlerDone and unblock the grace timer first, wait
+	// for any in-flight grace flush to finish, then stop the keepalive pinger.
+	defer stopKeepalive()
+	defer graceWG.Wait()
+	defer func() {
+		handlerDone.Store(true)
+		markStreamStarted()
+	}()
 
 	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
 		streamMu.Lock()
@@ -278,7 +283,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		// check is strictly stronger than the status-line one, because a
 		// downgrade detected there still stops the stream and the client sees the
 		// mismatch in the frames.
+		graceWG.Add(1)
 		go func() {
+			defer graceWG.Done()
 			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
 			defer timer.Stop()
 			select {
@@ -531,8 +538,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
 								sentText = text
 								lastActiveKeepaliveAt = time.Now()
-						} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
+							} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
+								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" && !toolbridge.IsToolProtocolRefusal(text) {
 									startStream(false)
 									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
 									sentText = safePrefix
