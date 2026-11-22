@@ -2,6 +2,7 @@ package cookies
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -126,6 +127,8 @@ func FindBrowserBinary(browser string) string {
 }
 
 // isolatedLoginArgs builds the disposable-profile browser command line.
+// Native CDP requests use loopback and send no browser Origin header, so the
+// browser does not need a remote-allow-origins override.
 //
 // Device Bound Session Credentials are disabled on purpose. When Chrome
 // registers a DBSC binding, Google only refreshes the short-lived session
@@ -136,11 +139,11 @@ func FindBrowserBinary(browser string) string {
 func isolatedLoginArgs(profileDir string, port int) []string {
 	return []string{
 		fmt.Sprintf("--user-data-dir=%s", profileDir),
+		"--remote-debugging-address=127.0.0.1",
 		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--remote-allow-origins=*",
 		"--no-first-run",
 		"--no-default-browser-check",
-		"--disable-features=DeviceBoundSessionCredentials,DeviceBoundSessions,DeviceBoundSessionsForGoogle,DeviceBoundSessionsForSingleSignOn,DeviceBoundSessionsFederatedRegistration,DeviceBoundSessionsOnFirstSync,BoundSessionCredentials,EnableBoundSessionCredentials,EnableBoundSessionCredentialsContinuity",
+		"--disable-features=DeviceBoundSessionCredentials,BoundSessionCredentials,EnableBoundSessionCredentials,DeviceBoundSessions,DeviceBoundSessionsForGoogle,DeviceBoundSessionsForSingleSignOn,DeviceBoundSessionsFederatedRegistration,DeviceBoundSessionsOnFirstSync,EnableBoundSessionCredentialsContinuity",
 		"--new-window",
 		"https://gemini.google.com/app",
 	}
@@ -180,99 +183,59 @@ func RunIsolatedBrowserLogin(ctx context.Context, browserBin string) (*IsolatedL
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("launch browser %s: %w", browserBin, err)
 	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-		}
-	}()
-
 	procDone := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
 		close(procDone)
 	}()
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-procDone
+	}()
 
-	ticker := time.NewTicker(1200 * time.Millisecond)
+	const (
+		pollInterval       = 900 * time.Millisecond
+		cookieStableWindow = 1800 * time.Millisecond
+		cookieGraceCap     = 12 * time.Second
+	)
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	readyPolls := 0
+	var firstReadyAt, lastChangeAt time.Time
+	var lastResult *IsolatedLoginResult
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-procDone:
+			if lastResult != nil {
+				return lastResult, nil
+			}
 			return nil, fmt.Errorf("browser window was closed before Google sign-in completed")
 		case <-ticker.C:
-			hdr, ua, pageReady, ok := pollIsolatedCDPCookies(ctx, port)
-			if !ok {
-				readyPolls = 0
+			hdr, ua, baseReady, rotReady := pollIsolatedCDPCookies(ctx, port)
+			if !baseReady {
 				continue
 			}
-			readyPolls++
-			// Allow Chrome a brief settle window (or page readyState=complete)
-			// so redirects like CheckCookie/SetOSID finish before killing Chrome.
-			if pageReady && readyPolls >= 2 || readyPolls >= 5 {
-				return &IsolatedLoginResult{
+			now := time.Now()
+			if firstReadyAt.IsZero() {
+				firstReadyAt = now
+			}
+			if lastResult == nil || hdr != lastResult.CookieHeader {
+				lastResult = &IsolatedLoginResult{
 					CookieHeader: hdr,
 					UserAgent:    ua,
-				}, nil
+				}
+				lastChangeAt = now
+			}
+			if (rotReady && now.Sub(lastChangeAt) >= cookieStableWindow) || now.Sub(firstReadyAt) >= cookieGraceCap {
+				return lastResult, nil
 			}
 		}
 	}
-}
-
-type cdpCookie struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Domain string `json:"domain"`
-}
-
-func googleCookieDomainScore(domain string) int {
-	switch {
-	case domain == ".google.com" || domain == "google.com":
-		return 3
-	case domain == "gemini.google.com" || domain == ".gemini.google.com":
-		return 2
-	case strings.HasSuffix(domain, ".google.com"):
-		return 1
-	default:
-		return 0
-	}
-}
-
-func extractGoogleCookiesFromCDP(list []cdpCookie) (string, bool) {
-	bestVal := make(map[string]string)
-	bestScore := make(map[string]int)
-	var order []string
-	for _, c := range list {
-		score := googleCookieDomainScore(c.Domain)
-		if score == 0 || c.Name == "" || c.Value == "" {
-			continue
-		}
-		if _, exists := bestVal[c.Name]; !exists {
-			order = append(order, c.Name)
-		}
-		if score > bestScore[c.Name] {
-			bestVal[c.Name] = c.Value
-			bestScore[c.Name] = score
-		}
-	}
-
-	if bestVal["SAPISID"] == "" && bestVal["__Secure-3PAPISID"] == "" {
-		return "", false
-	}
-	if bestVal["__Secure-1PSID"] == "" || bestVal["__Secure-1PSIDTS"] == "" {
-		return "", false
-	}
-
-	parts := make([]string, 0, len(order))
-	for _, name := range order {
-		if v := bestVal[name]; v != "" {
-			parts = append(parts, name+"="+v)
-		}
-	}
-	return strings.Join(parts, "; "), true
 }
 
 func checkGeminiPageReadyCDP(ctx context.Context, wsURL string) bool {
@@ -296,7 +259,34 @@ func checkGeminiPageReadyCDP(ctx context.Context, wsURL string) bool {
 	return res.Result.Result.Value
 }
 
-func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAgent string, pageReady, ready bool) {
+func extractIsolatedCookies(rawCookies []domainCookie) (cookieHeader string, baseReady, rotReady bool) {
+	filtered := make([]domainCookie, 0, len(rawCookies))
+	for _, c := range rawCookies {
+		if !isGoogleCookieDomain(c.Domain) || c.Name == "" || c.Value == "" {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	best, hdr := selectBestDomainCookieMap(filtered)
+	baseReady = best["SAPISID"] != "" &&
+		best["__Secure-1PSID"] != "" &&
+		best["__Secure-1PSIDTS"] != ""
+	if !baseReady {
+		return "", false, false
+	}
+	rotReady = best["OSID"] != "" && best["SIDCC"] != "" && best["__Secure-1PSIDCC"] != "" && best["__Secure-3PSIDTS"] != ""
+	return hdr, true, rotReady
+}
+
+// CDP discovery must not consult environment proxies or follow redirects.
+var isolatedCDPClient = &http.Client{
+	Transport: &http.Transport{DisableKeepAlives: true},
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAgent string, baseReady, rotReady bool) {
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
@@ -305,7 +295,7 @@ func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAg
 	if err != nil {
 		return "", "", false, false
 	}
-	respVer, err := http.DefaultClient.Do(reqVer)
+	respVer, err := isolatedCDPClient.Do(reqVer)
 	if err != nil {
 		return "", "", false, false
 	}
@@ -313,15 +303,18 @@ func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAg
 		UserAgent            string `json:"User-Agent"`
 		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 	}
-	_ = json.NewDecoder(respVer.Body).Decode(&verInfo)
+	verErr := json.NewDecoder(io.LimitReader(respVer.Body, 1<<20)).Decode(&verInfo)
 	_ = respVer.Body.Close()
+	if respVer.StatusCode != http.StatusOK || verErr != nil {
+		return "", "", false, false
+	}
 
 	listURL := fmt.Sprintf("http://127.0.0.1:%d/json/list", port)
 	reqList, err := http.NewRequestWithContext(cctx, http.MethodGet, listURL, nil)
 	if err != nil {
 		return "", "", false, false
 	}
-	respList, err := http.DefaultClient.Do(reqList)
+	respList, err := isolatedCDPClient.Do(reqList)
 	if err != nil {
 		return "", "", false, false
 	}
@@ -330,33 +323,43 @@ func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAg
 		URL                  string `json:"url"`
 		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 	}
-	_ = json.NewDecoder(respList.Body).Decode(&targets)
+	listErr := json.NewDecoder(io.LimitReader(respList.Body, 1<<20)).Decode(&targets)
 	_ = respList.Body.Close()
+	if respList.StatusCode != http.StatusOK || listErr != nil {
+		return "", "", false, false
+	}
 
-	pageWSURL := ""
 	wsURL := ""
+	pageWSURL := ""
 	onGeminiApp := false
 	for _, t := range targets {
 		if t.Type == "page" && strings.HasPrefix(t.URL, "https://gemini.google.com/") && !strings.Contains(t.URL, "accounts.google.com") {
 			onGeminiApp = true
-			if t.WebSocketDebuggerURL != "" {
+			if pageWSURL == "" && t.WebSocketDebuggerURL != "" {
 				pageWSURL = t.WebSocketDebuggerURL
-				wsURL = t.WebSocketDebuggerURL
-				break
 			}
 		}
 	}
 	if !onGeminiApp {
 		return "", "", false, false
 	}
-	if wsURL == "" {
+	if verInfo.WebSocketDebuggerURL != "" {
 		wsURL = verInfo.WebSocketDebuggerURL
+	} else {
+		wsURL = pageWSURL
 	}
-	if wsURL == "" {
+	endpoint, err := url.Parse(wsURL)
+	if err != nil || endpoint.Scheme != "ws" || endpoint.Host != net.JoinHostPort("127.0.0.1", fmt.Sprint(port)) ||
+		endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || !strings.HasPrefix(endpoint.Path, "/devtools/") {
 		return "", "", false, false
 	}
 
-	rawJSON, err := cdpCallStdlibWS(cctx, wsURL, `{"id":1,"method":"Network.getAllCookies"}`)
+	rawJSON, err := cdpCallStdlibWS(cctx, wsURL, `{"id":1,"method":"Storage.getCookies"}`)
+	if err != nil && pageWSURL != "" && pageWSURL != wsURL {
+		rawJSON, err = cdpCallStdlibWS(cctx, pageWSURL, `{"id":1,"method":"Network.getAllCookies"}`)
+	} else if err != nil {
+		rawJSON, err = cdpCallStdlibWS(cctx, wsURL, `{"id":1,"method":"Network.getAllCookies"}`)
+	}
 	if err != nil {
 		return "", "", false, false
 	}
@@ -364,19 +367,42 @@ func pollIsolatedCDPCookies(ctx context.Context, port int) (cookieHeader, userAg
 	var reply struct {
 		ID     int `json:"id"`
 		Result struct {
-			Cookies []cdpCookie `json:"cookies"`
+			Cookies []domainCookie `json:"cookies"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(rawJSON, &reply); err != nil {
 		return "", "", false, false
 	}
 
-	hdr, ok := extractGoogleCookiesFromCDP(reply.Result.Cookies)
-	if !ok {
+	hdr, baseReady, rotReady := extractIsolatedCookies(reply.Result.Cookies)
+	if !baseReady {
 		return "", "", false, false
 	}
+	if rotReady && pageWSURL != "" {
+		rotReady = checkGeminiPageReadyCDP(cctx, pageWSURL)
+	}
+	return hdr, verInfo.UserAgent, true, rotReady
+}
 
-	return hdr, verInfo.UserAgent, checkGeminiPageReadyCDP(cctx, pageWSURL), true
+func writeMaskedWSFrame(w io.Writer, firstByte byte, msg []byte) error {
+	var mask [4]byte
+	_, _ = rand.Read(mask[:])
+	header := []byte{firstByte}
+	switch {
+	case len(msg) < 126:
+		header = append(header, byte(0x80|len(msg)))
+	case len(msg) <= 65535:
+		header = append(header, 0x80|126, byte(len(msg)>>8), byte(len(msg)))
+	default:
+		return fmt.Errorf("payload too large")
+	}
+	header = append(header, mask[:]...)
+	masked := make([]byte, len(msg))
+	for i := range msg {
+		masked[i] = msg[i] ^ mask[i%4]
+	}
+	_, err := w.Write(append(header, masked...))
+	return err
 }
 
 func cdpCallStdlibWS(ctx context.Context, wsURL string, payload string) ([]byte, error) {
@@ -390,7 +416,14 @@ func cdpCallStdlibWS(ctx context.Context, wsURL string, payload string) ([]byte,
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+
+	dl := time.Now().Add(2 * time.Second)
+	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(dl) {
+		dl = ctxDL
+	}
+	_ = conn.SetDeadline(dl)
 
 	var keyBytes [16]byte
 	_, _ = rand.Read(keyBytes[:])
@@ -416,54 +449,103 @@ func cdpCallStdlibWS(ctx context.Context, wsURL string, payload string) ([]byte,
 		}
 	}
 
+	wantID := 1
+	var reqProbe struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(payload), &reqProbe); err == nil && reqProbe.ID != 0 {
+		wantID = reqProbe.ID
+	}
+
 	// Send masked text frame (opcode 0x81)
-	msg := []byte(payload)
-	var mask [4]byte
-	_, _ = rand.Read(mask[:])
-	header := []byte{0x81}
-	switch {
-	case len(msg) < 126:
-		header = append(header, byte(0x80|len(msg)))
-	case len(msg) <= 65535:
-		header = append(header, 0x80|126, byte(len(msg)>>8), byte(len(msg)))
-	default:
-		return nil, fmt.Errorf("payload too large")
-	}
-	header = append(header, mask[:]...)
-	masked := make([]byte, len(msg))
-	for i := range msg {
-		masked[i] = msg[i] ^ mask[i%4]
-	}
-	if _, err := conn.Write(append(header, masked...)); err != nil {
+	if err := writeMaskedWSFrame(conn, 0x81, []byte(payload)); err != nil {
 		return nil, err
 	}
 
-	// Read unmasked server frame
-	var hdr [2]byte
-	if _, err := io.ReadFull(br, hdr[:]); err != nil {
-		return nil, err
-	}
-	length := uint64(hdr[1] & 0x7f)
-	switch length {
-	case 126:
-		var ext [2]byte
-		if _, err := io.ReadFull(br, ext[:]); err != nil {
+	const maxWSMessageBytes = 16 * 1024 * 1024
+	var assembled bytes.Buffer
+	inFragmented := false
+
+	for {
+		var hdr [2]byte
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
 			return nil, err
 		}
-		length = uint64(binary.BigEndian.Uint16(ext[:]))
-	case 127:
-		var ext [8]byte
-		if _, err := io.ReadFull(br, ext[:]); err != nil {
+		fin := (hdr[0] & 0x80) != 0
+		opcode := hdr[0] & 0x0f
+		masked := (hdr[1] & 0x80) != 0
+		length := uint64(hdr[1] & 0x7f)
+		switch length {
+		case 126:
+			var ext [2]byte
+			if _, err := io.ReadFull(br, ext[:]); err != nil {
+				return nil, err
+			}
+			length = uint64(binary.BigEndian.Uint16(ext[:]))
+		case 127:
+			var ext [8]byte
+			if _, err := io.ReadFull(br, ext[:]); err != nil {
+				return nil, err
+			}
+			length = binary.BigEndian.Uint64(ext[:])
+		}
+		if length > maxWSMessageBytes {
+			return nil, fmt.Errorf("ws frame too large: %d", length)
+		}
+		var frameMask [4]byte
+		if masked {
+			if _, err := io.ReadFull(br, frameMask[:]); err != nil {
+				return nil, err
+			}
+		}
+		frameData := make([]byte, length)
+		if _, err := io.ReadFull(br, frameData); err != nil {
 			return nil, err
 		}
-		length = binary.BigEndian.Uint64(ext[:])
+		if masked {
+			for i := range frameData {
+				frameData[i] ^= frameMask[i%4]
+			}
+		}
+
+		switch opcode {
+		case 0x08: // Close
+			return nil, io.EOF
+		case 0x09: // Ping
+			if err := writeMaskedWSFrame(conn, 0x8A, frameData); err != nil {
+				return nil, err
+			}
+			continue
+		case 0x0A: // Pong
+			continue
+		case 0x01, 0x02: // Text / Binary start
+			assembled.Reset()
+			assembled.Write(frameData)
+			inFragmented = !fin
+		case 0x00: // Continuation
+			if !inFragmented {
+				return nil, fmt.Errorf("unexpected ws continuation frame")
+			}
+			if uint64(assembled.Len())+length > maxWSMessageBytes {
+				return nil, fmt.Errorf("ws assembled message too large")
+			}
+			assembled.Write(frameData)
+			if fin {
+				inFragmented = false
+			}
+		default:
+			continue
+		}
+
+		if fin && !inFragmented {
+			msg := append([]byte(nil), assembled.Bytes()...)
+			assembled.Reset()
+			var probe struct {
+				ID int `json:"id"`
+			}
+			if err := json.Unmarshal(msg, &probe); err == nil && probe.ID == wantID {
+				return msg, nil
+			}
+		}
 	}
-	if length > 16*1024*1024 {
-		return nil, fmt.Errorf("ws frame too large: %d", length)
-	}
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(br, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
 }
